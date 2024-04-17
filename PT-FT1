@@ -1,0 +1,477 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Wed Dec  6 13:15:52 2023
+
+@author: LK
+"""
+# IMPORT LIBRARIES
+
+import numpy as np
+# import math
+import MetaTrader5 as mt5
+import datetime
+# from time import sleep
+# import matplotlib.pyplot as plt 
+import time
+import pandas as pd
+# import statsmodels.api as sm
+# import talib
+import pandas_ta as ta
+import pytz
+# import scipy.stats as stats
+# import joblib
+from statsmodels.tsa.stattools import coint
+import xgboost as xgb
+# from pylab import mpl, plt
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import RandomForestRegressor
+# from sklearn.metrics import accuracy_score
+# from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import mean_squared_error
+from sklearn.neural_network import MLPRegressor
+
+ML = 1
+res_check = pd.DataFrame(columns = ['entry','exit','type','profit','pred','sprd','time-diff'])
+
+curr1 = 'GBPUSD'
+# curr1 = 'BTCUSD'
+
+# LOGIN TO MT5
+account = 51610727
+mt5.initialize("C:/Program Files/MetaTrader 5/terminal64.exe")
+authorized=mt5.login(account, password="$ch9to$aJH", server = "mt5-demo.icmarkets.com")
+
+if authorized:
+    print("Connected: Connecting to MT5 Client")
+else:
+    print("Failed to connect at account #{}, error code: {}"
+          .format(account, mt5.last_error()))
+   
+# establish connection to MetaTrader 5 terminal
+if not mt5.initialize():
+    print("initialize() failed, error code =",mt5.last_error())
+    mt5.shutdown()
+timezone = pytz.timezone("Etc/UTC")
+
+# ALL FUNCTIONS
+def get_rates(curr_pair, rate_type=1):
+    
+    point = mt5.symbol_info(curr_pair).point
+    
+    if rate_type == 2:
+    # RATES FOR LAST 1000 BARS # OHLC
+        rates = mt5.copy_rates_from_pos(curr_pair, mt5.TIMEFRAME_M1, 0, 500)
+        rates_frame = pd.DataFrame(rates)
+        # rates_frame['log_return'] = np.log(rates_frame['close']).diff()
+        
+    if rate_type == 1:
+    # RATES FOR 10% OF DAY TICKS #### BID ASK
+        utc_to = datetime.datetime.fromtimestamp(mt5.symbol_info(curr_pair).time)
+        utc_from = utc_to - datetime.timedelta(days=0.01)
+        rates = mt5.copy_ticks_range(curr_pair, utc_from, utc_to, mt5.COPY_TICKS_ALL) # COPY_TICKS_INFO
+        rates_frame = pd.DataFrame(rates)
+        # rates_frame = rates_frame.drop(['bid','volume','last','volume_real','time','flags',], axis = 1)
+        rates_ask = rates_frame['ask'] # did this because the ask seems to be the correct values. Bid values were looking awkward
+        rates_frame['close'] = (rates_frame['ask'] + rates_frame['bid'])/2
+        # rates_frame1 = pd.DataFrame(rates)
+        # ask_prices = rates_ask.values.tolist()
+        # rates_frame = rates_frame.dropna()
+    
+    # if rate_type == 2:
+    rates_close = rates_frame['close']
+    close_prices = rates_close.values.tolist()
+    rates_frame['log_return'] = np.log(rates_frame['close']).diff()
+    rates_frame = rates_frame.dropna()
+    ret_close = rates_frame['log_return']
+    rates_ret = ret_close.values.tolist()
+       
+    # PARTICLE FILTER
+    def PFF(prices):
+        def state_space_model(x, v):
+            return x + v
+       
+        num_particles = 20
+        # initial_x = np.random.uniform(0, 20, num_particles)
+        initial_x = np.random.uniform(np.average(prices), np.std(prices), num_particles)
+        # initial_v = np.random.normal(0, 1, num_particles)
+        initial_v = np.random.normal(np.average(prices), np.std(prices), num_particles)
+        initial_particles = np.vstack([initial_x, initial_v]).T
+       
+        def propagate_particles(particles):
+            v = np.random.normal(0, 1, particles.shape[0])
+            x = state_space_model(particles[:, 0], v)
+            return np.vstack([x, v]).T
+       
+        def update_weights(particles, observation):
+            likelihood = 1 / np.sqrt(2 * np.pi) * np.exp(-0.5 * (observation - particles[:, 0]) ** 2)
+            return likelihood / np.sum(likelihood)
+       
+        def resample_particles(particles, weights):
+            indices = np.random.choice(particles.shape[0], particles.shape[0], p=weights)
+            return particles[indices]
+       
+        filtered_prices = []
+        particles = initial_particles
+        for i in range(len(prices)):
+            particles = propagate_particles(particles)
+            weights = update_weights(particles, prices[i])
+            particles = resample_particles(particles, weights)
+            filtered_prices.append(np.average(particles[:, 0], weights=weights))
+       
+        # print(filtered_prices)
+        # rmse = np.sqrt(mean_squared_error(prices[6000:], filtered_prices[6000:]))
+        # print("RMSE: ", rmse)
+       
+        return filtered_prices
+    
+    rates_frame['returns'] = pd.DataFrame(PFF(rates_ret))   
+    # rates_frame['close'] = pd.DataFrame(PFF(close_prices))
+    # rates_frame['ask'] = pd.DataFrame(PFF(ask_prices))
+    
+    # FOR BID/ASK TICK PRICES
+    if rate_type == 1:
+        rates_frame['time']=pd.to_datetime(rates_frame['time_msc'], unit='ms') 
+    
+    # FOR OHLC BARS
+    if rate_type == 2:
+        rates_frame['time']=pd.to_datetime(rates_frame['time'], unit='s')
+    
+       
+    # result = pd.concat([rates_frame], axis=1)
+    
+    # pd.concat([rates_frame['returns'], rates_frame['log_return']] axis=1).plot()   
+        
+    return rates_frame, point
+
+def get_signal(X_rates, Y_rates, X_pt, Y_pt, ML=1):     
+    if ML == 0:
+        X = X_rates['log_return']
+        Y = Y_rates['log_return']
+        
+        # TEST FOR COINTEGRATION
+        _, p_val, _ = coint(X,Y)
+        # print('P_Value = ', p_val)
+        
+        # X = sm.add_constant(X)  # Add a constant to the model (intercept)
+        # model = sm.OLS(Y, X).fit()
+        
+        spread = X - Y
+        spread.name = 'spread'
+        
+        spread_mavg1 = spread.rolling(1).mean()
+        spread_mavg1.name = 'spread-mavg-1d'
+        
+        spread_mavg30 = spread.rolling(100).mean()
+        spread_mavg30.name = 'spread-mavg-30d'
+        spread.plot()
+        spread_mavg30.plot()
+        # spread = Y - beta * X
+    
+        # std_30 = spread.rolling(3).std()
+        # std_30.name = 'std_30d'
+        
+        # # COMPUTE Z SCORE FOR EACH DAY
+        # zscore_30_1 = (spread_mavg1 - spread_mavg30)/std_30
+        # zscore_30_1.name = 'z-score'
+        # # zscore_30_1.plot()
+        
+        # pred_signal = zscore_30_1.iloc[-1]  ### use threshold of +1 and -1
+        
+        pred_signal = spread# - spread_mavg30
+        pred_signal = pred_signal.iloc[-1]  ### use threshold of +1 and -1
+        y_pred = 0
+    
+    # Apply ML
+    elif ML == 1:
+        X = pd.DataFrame(X_rates)#['close'])
+        X.ta.bbands(length=20, append=True)
+        X.ta.macd(fast=12, slow=26, signal=9, append=True)
+        # X.ta.cci(length=14, append=True)
+        X.ta.rsi(length=14, append=True)
+        # X.ta.stoch(append=True)
+        X['res'] = X['close'].pct_change(periods=100)
+        X = X.dropna()
+        X_res = X['res']
+        X = X.drop(['time','res'], axis = 1) 
+        
+        
+        Y = pd.DataFrame(Y_rates)#['close'])
+        Y.ta.bbands(length=20, append=True)
+        Y.ta.macd(fast=12, slow=26, signal=9, append=True)
+        # Y.ta.cci(length=14, append=True)
+        Y.ta.rsi(length=14, append=True)
+        # Y.ta.stoch(append=True)
+        Y['res'] = Y['close'].pct_change(periods=100)
+        Y = Y.dropna()
+        Y_res = Y['res']
+        Y = Y.drop(['time','res'], axis = 1)     
+        
+        
+        # XY = pd.DataFrame(X['x_pct'] - Y['y_pct'])
+        
+        # a = pd.merge(X_rates, Y_rates, on='time', how='outer')
+        # a['spread'] = a['log_return_x']-a['log_return_y']
+        # a['spread30'] = a.spread.rolling(30).mean()
+        # a['spread30std'] = a.spread.rolling(30).std()
+        # a["zs30"] = (a['spread'] - a['spread30'])/a['spread30std']
+        # a['y_shift'] = a['zs30'].shift(30, axis = 0)
+        # a['y_pct'] = a['zs30'].pct_change(periods=30)
+        # a = a.dropna()
+        
+        model = MLPRegressor(solver='lbfgs')
+        # model = xgb.XGBRegressor()
+        
+        # y = pd.DataFrame(a['y_pct'])
+        # y = pd.DataFrame(a['y_shift'])
+        # x = a.drop(['y_pct', 'time', 'y_shift'], axis=1)
+        def preda (x,y):
+            scaler = StandardScaler()
+            x_train, x_test, y_train, y_test = train_test_split(x,y, test_size= 0.1, shuffle=False)
+            x_train = scaler.fit_transform(x_train)
+            x_test = scaler.transform(x_test)
+            
+            model.fit(x_train, y_train)
+            
+            y_pred = model.predict(x_test)
+            y_pred = pd.DataFrame(y_pred)
+            pred1 = y_pred.tail(1)[0].item()
+            
+            return pred1
+    
+        Y_pred = preda(Y, Y_res)
+        X_pred = preda(X, X_res)
+        pred_signal = Y_pred - X_pred
+        y_pred = 0
+    
+    return pred_signal, y_pred   
+    
+def make_order(curr_pair, request):
+        symbol = curr_pair
+        lot = 3.0
+        tot_orders=mt5.positions_total()
+        point = mt5.symbol_info(symbol).point
+        deviation = 20
+        price = mt5.symbol_info_tick(symbol).ask
+        price2 = mt5.symbol_info_tick(symbol).bid
+        symbol_info = mt5.symbol_info(symbol)
+        
+        if symbol_info is None:
+            print(symbol, "not found, can not call order_check()")
+            mt5.shutdown()
+            quit()
+         
+        # if the symbol is unavailable in MarketWatch, add it
+        if not symbol_info.visible:
+            print(symbol, "is not visible, trying to switch on")
+            if not mt5.symbol_select(symbol,True):
+                print("symbol_select({}}) failed, exit",symbol)
+                mt5.shutdown()
+                quit()
+         
+        B_request = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": symbol,
+            "volume": lot,
+            "type": mt5.ORDER_TYPE_BUY,
+            "price": price,
+            "sl": 0.0,#price - (120000 * point),
+            "tp": 0.0,#price + (120000 * point),
+            "deviation": deviation,
+            "magic": 234000,
+            "comment": "python script open",
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": mt5.ORDER_FILLING_IOC,
+        }
+         
+        S_request = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": symbol,
+            "volume": lot,
+            "type": mt5.ORDER_TYPE_SELL,
+            "price": price2,
+            "sl": 0.0,#price + (120000 * point),
+            "tp": 0.0,#price - (120000 * point),
+            "deviation": deviation,
+            "magic": 234000,
+            "comment": "python script open",
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": mt5.ORDER_FILLING_IOC,
+        }
+        
+        if request == 1:
+            result = mt5.order_send(B_request)
+        elif request == 2:
+            result = mt5.order_send(S_request)
+            
+            
+        return result
+
+def close_position(position):
+    
+        tick = mt5.symbol_info_tick(position.symbol)
+    
+        request = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "position": position.ticket,
+            "symbol": position.symbol,
+            "volume": position.volume,
+            "type": mt5.ORDER_TYPE_BUY if position.type == 1 else mt5.ORDER_TYPE_SELL,
+            "price": tick.ask if position.type == 1 else tick.bid,  
+            "deviation": 20,
+            "magic": 100,
+            "comment": "python script close",
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": mt5.ORDER_FILLING_IOC,
+        }
+    
+        result = mt5.order_send(request)
+        print("CLOSE TRADE DONE - WIDEN THE GAP")
+        return result
+
+# START ALL COUNTERS
+c_getrate = 0
+c_getsignal = 0
+c_maketrade = 0
+c_loop = 0
+
+# OTHER VARIABLES
+if curr1 == 'GBPUSD': curr2 = 'EURUSD'
+if curr1 == 'BTCUSD': curr2 = 'ETHUSD'
+# res_check = pd.DataFrame()
+res_check = pd.DataFrame(columns = ['entry_time', 'exit_time', 'pred_signal', 'profit', 'drawUP', 'drawdown', 'trade_type'])
+ord = 0  #check if theres an order
+cnt = 200
+lot = 3
+drawdown = 0            
+drawUP = 0
+profit = 0
+fix_profit = 20.9
+fix_loss = -198.9
+
+entry_time = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime()) # current local time time.time()
+exit_time = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime()) # current local time time.time()
+
+if ML == 1:
+    sig1 = -0.1 # -5.0e-5 # widen gap trade
+    sig2 = 0.1 # 5.0e-5 # close gap trade
+else:
+    sig1 = -9.0e-5
+    sig2 = 9.0e-5
+
+P2_profit = 0
+P1_profit = 0
+
+
+# WHILE LOOP BEGINS
+while c_loop < 250:
+
+# GET RATES
+    pair1, X_pt = get_rates(curr1)
+    pair2, Y_pt = get_rates(curr2)
+# GET SIGNAL
+    pair1['spread'] = pair1['bid'] - pair1['ask']
+    pair2['spread'] = pair2['bid'] - pair2['ask']
+    pair1['ask'] = pair1['close'] + ((pair1['spread']+6)*X_pt/2)
+    pair1['bid'] = pair1['close'] - ((pair1['spread']+6)*X_pt/2)
+    pair2['ask'] = pair2['close'] + ((pair2['spread']+6)*Y_pt/2)
+    pair2['bid'] = pair2['close'] - ((pair2['spread']+6)*Y_pt/2)
+    
+    # pair1['fast'], pair1['slow'], pair1['signal'] = talib.MACD(pair1['bid'])
+    # pair1["RSI"] = talib.RSI(pair1["bid"], timeperiod=14)
+    # pair1["upper_band"], pair1["middle_band"], pair1["lower_band"] = talib.BBANDS(pair1["bid"], timeperiod=20)
+
+    # pair2['fast'], pair2['slow'], pair2['signal'] = talib.MACD(pair2['bid'])
+    # pair2["RSI"] = talib.RSI(pair2["bid"], timeperiod=14)
+    # pair2["upper_band"], pair2["middle_band"], pair2["lower_band"] = talib.BBANDS(pair2["bid"], timeperiod=20)
+
+    # MERGING PROCESS FOR TICKS
+    merged_df = pd.merge(pair1, pair2, on='time', how='outer') # merge DFs
+    merged_df = merged_df.sort_values(by='time') # sort inasc order
+    df_filled = merged_df.fillna(method='ffill') # fill each nan with previous cell
+    df_filled = df_filled.dropna() # drop nan
+    df_filled = df_filled.reset_index(drop=True) # reset index
+
+    pair3 = pd.DataFrame()
+    pair3[['time','bid', 'ask', 'close', 'log_return', 'returns']] = df_filled[['time','bid_x', 'ask_x', 'close_x', 'log_return_x', 'returns_x']]
+    pair1 = pair3
+    pair3 = pd.DataFrame()
+    pair3[['time','bid', 'ask', 'close', 'log_return', 'returns']] = df_filled[['time','bid_y', 'ask_y', 'close_y', 'log_return_y', 'returns_y']]
+    pair2 = pair3
+    
+    pred_signal, y_pred = get_signal(pair1, pair2, X_pt, Y_pt, ML)
+    print('Pred Signal: ', pred_signal)
+    sprd = mt5.symbol_info(curr1).spread
+# MAKE ORDER
+    if pred_signal >= sig2 and sprd <= 10: # and result1['RSI'].iloc[-1]>46: # and result1['RSI'].iloc[-1]<40 and result1['RSI'].iloc[-1]>60:
+    # if pred_signal>0.00001 and tot_orders < 1:
+    
+        result = make_order(curr2, 1)    
+        result = make_order(curr1, 2)
+        print("TRADE DONE - CLOSE THE GAP")
+        entry_time = time.time()
+        trade_type = 'CLOSE +1'
+        # tot_orders = mt5.positions_total()
+        order_code = 1
+        
+    
+    # send a sell request
+    if pred_signal <= sig1 and sprd <= 10: # and result1['RSI'].iloc[-1]>46: # and result1['RSI'].iloc[-1]<40 and result1['RSI'].iloc[-1]>60:
+    # if pred_signal<-0.00001 and tot_orders < 1:
+        result = make_order(curr2, 2)    
+        result = make_order(curr1, 1)
+        print("TRADE DONE - WIDEN THE GAP")
+        entry_time = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime()) # current local time time.time()
+        trade_type = 'WIDEN -1'
+        # tot_orders = mt5.positions_total()
+        order_code = 2
+
+# CLOSE TRADE
+    while len(mt5.positions_get()) > 0:
+        positions = mt5.positions_get()
+        pt = pd.DataFrame(list(mt5.positions_get()),columns=mt5.positions_get()[0]._asdict().keys())
+        # position_id = pt.ticket.item()
+        profit = pt['profit'].sum()
+        
+        if profit <= drawdown:  
+            drawdown = profit
+        if profit >= drawUP:  
+            drawUP = profit
+            
+        if profit > fix_profit or profit < fix_loss:
+            # closa = 0
+            c_loop = c_loop +1
+            for position in positions:
+                close_result = close_position(position)
+                exit_time = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime()) # current local time time.time()
+                
+                if close_result.retcode != mt5.TRADE_RETCODE_DONE:
+                    print("4. order_send failed, retcode={}".format(close_result.retcode))
+                    print("   result",close_result)
+                else:
+                    # print("4. position #{} closed, {}".format(position_id,close_result))
+                    # request the result as a dictionary and display it element by element
+                    result_dict=close_result._asdict()
+                    for field in result_dict.keys():
+                        print("   {}={}".format(field,result_dict[field]))
+                        # if this is a trading request structure, display it element by element as well
+                        if field=="request":
+                            traderequest_dict=result_dict[field]._asdict()
+                            for tradereq_filed in traderequest_dict:
+                                print("       traderequest: {}={}".format(tradereq_filed,traderequest_dict[tradereq_filed]))
+
+        # RESET ALL COUNTEERS (PRINT, RINSE & REPEAT)
+            new_row = pd.DataFrame([entry_time, exit_time, pred_signal, profit, drawUP, drawdown, trade_type]).transpose() 
+            res_check = pd.concat([res_check,new_row],)
+            
+            # res_check.columns = ['entry_time', 'ex_time','entry_signal', 'exit_signal', 'profit', 'drawUP', 'drawdown', 'trade_type']
+            print('TRADE PROFIT = ', profit)
+            print('TOTAL PROFIT = ', res_check['profit'].sum())
+            
+            drawdown = 0
+            drawUP = 0
+            profit = 0
+
+    # c_loop = c_loop +1
+
+
