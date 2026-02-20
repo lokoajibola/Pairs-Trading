@@ -37,10 +37,14 @@ res_check = pd.DataFrame(columns = ['entry','exit','type','profit','pred','sprd'
 curr1 = 'GBPUSD'
 # curr1 = 'BTCUSD'
 
-# LOGIN TO MT5
-account = 51610727
-mt5.initialize("C:/Program Files/MetaTrader 5/terminal64.exe")
-authorized=mt5.login(account, password="$ch9to$aJH", server = "mt5-demo.icmarkets.com")
+# # LOGIN TO MT5
+import os
+account = int(os.getenv('MT5_ACCOUNT'))
+password = os.getenv('MT5_PASSWORD')
+server = os.getenv('MT5_SERVER')
+mt5.initialize("C:/Program Files/FxPro - MetaTrader 5/terminal64.exe")
+authorized=mt5.login(account, password = password, server = server)
+
 
 if authorized:
     print("Connected: Connecting to MT5 Client")
